@@ -3,17 +3,21 @@ package org.pay.controller;
 import com.stripe.Stripe;
 import com.stripe.exception.StripeException;
 import com.stripe.model.Event;
-import com.stripe.model.EventDataObjectDeserializer;
 import com.stripe.model.PaymentIntent;
 import com.stripe.net.Webhook;
 import com.stripe.param.PaymentIntentCreateParams;
+import com.stripe.exception.InvalidRequestException;
 import jakarta.annotation.PostConstruct;
+import org.pay.model.ApiResponse;
+import org.pay.model.PaymentRequest;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Optional;
 
 @RestController
 @RequestMapping("/stripe")
@@ -37,35 +41,41 @@ public class StripeController {
      * - En succès, retourne 'clientSecret' pour finaliser paiement côté client.
      * - En échec (ex. erreur Stripe), renvoie erreur 500.
      */
-
     @PostMapping("/pay")
-    public ResponseEntity<?> createPaymentIntent(@RequestBody Map<String, Object> data) {
+    public ResponseEntity<?> createPaymentIntent(@RequestBody PaymentRequest paymentRequest) {
         try {
-            String name = (String) data.get("name");
-            if (name == null || name.isEmpty()) {
-                return ResponseEntity.badRequest().body(Map.of("message", "Please enter a name"));
+            if (paymentRequest.getName() == null || paymentRequest.getName().isEmpty() ||
+                    paymentRequest.getAmount() == null || paymentRequest.getCurrency() == null) {
+                return ResponseEntity.badRequest().body(new ApiResponse(HttpStatus.BAD_REQUEST, "Missing required fields", null));
             }
 
-            PaymentIntentCreateParams params =
-                    PaymentIntentCreateParams.builder()
-                            .setAmount(200L)
-                            .setCurrency("eur")
-                            .addPaymentMethodType("card")
-                            .putMetadata("name", name)
-                            .build();
+            // Vérification du montant minimum
+            if (paymentRequest.getAmount() < 50) { // Montant minimum de 0.50 EUR en centimes (50 centimes)
+                return ResponseEntity.badRequest().body(new ApiResponse(HttpStatus.BAD_REQUEST, "Amount must be at least €0.50 EUR", null));
+            }
+
+            PaymentIntentCreateParams params = PaymentIntentCreateParams.builder()
+                    .setAmount(paymentRequest.getAmount())
+                    .setCurrency(paymentRequest.getCurrency())
+                    .addPaymentMethodType("card")
+                    .putMetadata("name", paymentRequest.getName())
+                    .build();
 
             PaymentIntent paymentIntent = PaymentIntent.create(params);
 
-            Map<String, Object> response = new HashMap<>();
-            response.put("message", "Payment initiated");
-            response.put("clientSecret", paymentIntent.getClientSecret());
+            Map<String, Object> data = new HashMap<>();
+            data.put("clientSecret", paymentIntent.getClientSecret());
 
-            return ResponseEntity.ok(response);
+            return ResponseEntity.ok(new ApiResponse(HttpStatus.OK, "Payment initiated", data));
+        } catch (InvalidRequestException e) {
+            e.printStackTrace();
+            return ResponseEntity.badRequest().body(new ApiResponse(HttpStatus.BAD_REQUEST, "Invalid request", null));
         } catch (StripeException e) {
             e.printStackTrace();
-            return ResponseEntity.internalServerError().body(Map.of("message", "Internal server error"));
+            return ResponseEntity.internalServerError().body(new ApiResponse(HttpStatus.INTERNAL_SERVER_ERROR, "Internal server error", null));
         }
     }
+
 
     /**
      * Route POST '/webhook' est utilisée pour recevoir des notifications de webhook de Stripe.
@@ -91,7 +101,7 @@ public class StripeController {
      * via le tableau de bord Stripe et sécuriser votre route en vérifiant la signature de chaque requête reçue.
      */
     @PostMapping("/webhook")
-    public ResponseEntity<?> stripeWebhook(@RequestBody String payload, @RequestHeader("Stripe-Signature") String sigHeader) {
+    public ResponseEntity<ApiResponse> stripeWebhook(@RequestBody String payload, @RequestHeader("Stripe-Signature") String sigHeader) {
         try {
             String endpointSecret = stripeWebhookKey;
             Event event = Webhook.constructEvent(
@@ -99,25 +109,26 @@ public class StripeController {
             );
 
             // Gestion des types d'événement
+            Map<String, Object> data = new HashMap<>();
             if ("payment_intent.created".equals(event.getType()) || "payment_intent.succeeded".equals(event.getType())) {
-                EventDataObjectDeserializer dataObjectDeserializer = event.getDataObjectDeserializer();
-                PaymentIntent paymentIntent = null;
-                if (dataObjectDeserializer.getObject().isPresent()) {
-                    paymentIntent = (PaymentIntent) dataObjectDeserializer.getObject().get();
-                    String name = paymentIntent.getMetadata().get("name");
+                PaymentIntent paymentIntent = (PaymentIntent) event.getDataObjectDeserializer().getObject().orElse(null);
+                if (paymentIntent != null) {
+                    String name = Optional.ofNullable(paymentIntent.getMetadata().get("name")).orElse("Unknown");
                     if ("payment_intent.created".equals(event.getType())) {
                         System.out.println(name + " initiated payment!");
                     } else {
                         System.out.println(name + " succeeded payment!");
                         // fulfilment
                     }
+                    data.put("eventName", event.getType());
+                    data.put("name", name);
                 }
             }
 
-            return ResponseEntity.ok(Map.of("ok", true));
+            return ResponseEntity.ok(new ApiResponse(HttpStatus.OK, "Webhook received", data));
         } catch (StripeException e) {
             e.printStackTrace();
-            return ResponseEntity.status(400).body(Map.of("message", e.getMessage()));
+            return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(new ApiResponse(HttpStatus.BAD_REQUEST, e.getMessage(), null));
         }
     }
 }
